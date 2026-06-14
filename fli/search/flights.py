@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
+import random
+import time
 import urllib.parse
 from copy import deepcopy
 
@@ -30,16 +34,51 @@ from fli.search._urls import with_locale_params as _with_locale_params  # noqa: 
 from fli.search._wire import iter_wrb_chunks, parse_first_wrb_payload
 from fli.search.client import get_client
 
+# Re-exported for backwards compatibility — the definitions moved to
+# ``fli.search.exceptions`` so the low-level wire reader can raise them
+# without a circular import. Existing callers still do
+# ``from fli.search.flights import SearchParseError``.
+from fli.search.exceptions import (  # noqa: F401
+    FlightsAPIError,
+    SearchParseError,
+)
+
 logger = logging.getLogger(__name__)
 
 
-class SearchParseError(Exception):
-    """Raised when a successful HTTP response cannot be parsed into flights.
+def _env_float(name: str, default: float) -> float:
+    """Read a non-negative float tuning knob from the environment.
 
-    Distinct from network / HTTP errors raised by the underlying client —
-    use this to tell "Google responded but the shape changed" apart from
-    "Google didn't respond at all".
+    A malformed value falls back to ``default`` with a warning rather than
+    crashing import (these knobs are optional tuning, not correctness).
     """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using default %s", name, raw, default)
+        return default
+    # Reject NaN/Inf too — they parse fine but later crash ``int(...)`` at
+    # import or produce nonsensical sleeps, defeating the fall-back guarantee.
+    if not math.isfinite(value) or value < 0:
+        logger.warning("Ignoring invalid %s=%r; using default %s", name, raw, default)
+        return default
+    return value
+
+
+# Bounded retry for the primary GetShoppingResults call. Google now
+# intermittently rejects the RPC with a transient ``ErrorResponse``
+# (issue #200) — anti-abuse throttling, not a malformed request. A cold
+# process's first request fails disproportionately often (the response
+# seeds a cookie the retry then carries), so a couple of jittered retries
+# turn the common "empty result" failure back into real flights without
+# hammering the endpoint. Configurable via env; set
+# ``FLI_SHOPPING_MAX_ATTEMPTS=1`` to fail loud on the first rejection.
+SHOPPING_MAX_ATTEMPTS = max(1, int(_env_float("FLI_SHOPPING_MAX_ATTEMPTS", 3)))
+SHOPPING_RETRY_DELAY = _env_float("FLI_SHOPPING_RETRY_DELAY", 1.0)
+SHOPPING_RETRY_JITTER = _env_float("FLI_SHOPPING_RETRY_JITTER", 1.0)
 
 
 class SearchFlights:
@@ -163,15 +202,13 @@ class SearchFlights:
         encoded = filters.encode()
         url = with_locale_params(self.BASE_URL, currency, language, country)
 
-        response = self.client.post(
-            url=url,
-            data=f"f.req={encoded}",
-            impersonate="chrome",
-            allow_redirects=True,
-        )
-        response.raise_for_status()
-
-        inner = parse_first_wrb_payload(response.text)
+        # Only the primary (session-capturing) call retries a transient
+        # rejection. Parallel expansion workers do a single attempt so the
+        # round-trip fan-out can't multiply requests against the anti-abuse
+        # ceiling; a rejection there raises, and ``_expand_multi_leg`` skips
+        # that one candidate rather than failing the whole search.
+        max_attempts = SHOPPING_MAX_ATTEMPTS if capture_session else 1
+        inner = self._post_and_parse(url, encoded, max_attempts=max_attempts)
         if inner is None:
             return None
 
@@ -217,6 +254,46 @@ class SearchFlights:
             )
 
         return flights or None
+
+    def _post_and_parse(self, url: str, encoded: str, *, max_attempts: int) -> list | None:
+        """POST one ``GetShoppingResults`` request and parse the wire payload.
+
+        Retries up to ``max_attempts`` times on a transient
+        :class:`FlightsAPIError` (Google's ``ErrorResponse`` rejection —
+        issue #200), since the same request usually succeeds on a follow-up
+        call. A genuinely empty-but-valid body (``None``) is returned
+        immediately without retrying. After the final attempt the
+        :class:`FlightsAPIError` propagates so a rejection is never silently
+        downgraded to "no flights".
+        """
+        for attempt in range(1, max_attempts + 1):
+            response = self.client.post(
+                url=url,
+                data=f"f.req={encoded}",
+                impersonate="chrome",
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+            try:
+                return parse_first_wrb_payload(response.text)
+            except FlightsAPIError as e:
+                if attempt >= max_attempts:
+                    logger.warning(
+                        "GetShoppingResults rejected after %d attempt(s): %s",
+                        attempt,
+                        e,
+                    )
+                    raise
+                delay = SHOPPING_RETRY_DELAY * attempt + random.uniform(0, SHOPPING_RETRY_JITTER)
+                logger.info(
+                    "GetShoppingResults rejected (attempt %d/%d); retrying in %.1fs",
+                    attempt,
+                    max_attempts,
+                    delay,
+                )
+                time.sleep(delay)
+        # Unreachable: the loop either returns or raises on the last attempt.
+        return None
 
     def get_booking_options(
         self,
@@ -486,13 +563,21 @@ class SearchFlights:
         def expand(outbound: FlightResult):
             next_filters = deepcopy(filters)
             next_filters.flight_segments[selected_count].selected_flight = outbound
-            sub_flights = self._fetch_flights(
-                next_filters,
-                currency=currency,
-                language=language,
-                country=country,
-                capture_session=False,
-            )
+            try:
+                sub_flights = self._fetch_flights(
+                    next_filters,
+                    currency=currency,
+                    language=language,
+                    country=country,
+                    capture_session=False,
+                )
+            except FlightsAPIError as e:
+                # A transient rejection on one outbound candidate's next-leg
+                # fetch must not sink the whole round-trip — skip this
+                # candidate and keep the combos we can build. The primary
+                # outbound search already fails loud if it is rejected.
+                logger.warning("Skipping next-leg expansion for one candidate: %s", e)
+                return outbound, None
             if sub_flights is None:
                 return outbound, None
             # If more segments remain unselected (multi-city ≥ 3), keep
