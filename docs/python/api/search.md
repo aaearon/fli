@@ -97,6 +97,50 @@ For more advanced examples, see:
 * `examples/python/result_processing.py` - Data analysis
 * `examples/python/error_handling_with_retries.py` - Robust error handling
 
+## Error Handling
+
+### Rejected shopping searches (issue #200)
+
+Google's `GetShoppingResults` endpoint intermittently rejects a request with
+an HTTP 200 `travel.frontend.flights.ErrorResponse` envelope instead of flight
+data. This is transient anti-abuse / rate-limiting of automated traffic from a
+single egress IP — the request payload itself is valid, and the same search
+typically succeeds on retry.
+
+`SearchFlights.search()` handles this in two ways:
+
+* **Bounded retry** — the primary call is retried a few times on a rejection
+  (a cold process's first request fails disproportionately often, and the
+  retry carries the cookie the first response set). Parallel round-trip
+  expansion calls are *not* retried, to avoid compounding the throttling.
+* **Fail loud** — if every attempt is rejected, a
+  [`FlightsAPIError`][fli.search.exceptions.FlightsAPIError] is raised rather
+  than returning an empty result. A rejection never masquerades as
+  `success:true, count:0`.
+
+```python
+from fli.search import SearchFlights
+from fli.search.exceptions import FlightsAPIError
+
+try:
+    results = SearchFlights().search(filters)
+except FlightsAPIError as e:
+    # Google rejected the request (code in e.error_code). Usually transient —
+    # back off and retry, or run through a proxy / different egress IP.
+    print(f"Rejected by Google Flights (code={e.error_code}); try again shortly")
+```
+
+The retry budget is tunable via environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `FLI_SHOPPING_MAX_ATTEMPTS` | Total attempts for the primary shopping call (`1` = fail loud on first rejection) | `3` |
+| `FLI_SHOPPING_RETRY_DELAY` | Base backoff in seconds (multiplied by attempt number) | `1.0` |
+| `FLI_SHOPPING_RETRY_JITTER` | Extra random backoff (0–N seconds) added per retry | `1.0` |
+
+For high-volume use, route requests through rotating proxies and pace each
+egress IP slowly rather than raising the per-call retry count.
+
 ## HTTP Client
 
 The underlying HTTP client used for API requests.

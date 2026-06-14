@@ -2,7 +2,25 @@
 
 import json
 
-from fli.search._wire import iter_wrb_chunks, parse_first_wrb_payload
+import pytest
+
+from fli.search._wire import find_api_error, iter_wrb_chunks, parse_first_wrb_payload
+from fli.search.exceptions import FlightsAPIError
+
+# The exact body Google's GetShoppingResults now returns when it rejects a
+# request (issue #200). Captured live 2026-06-14 for AMS->DXB. HTTP 200, ~325
+# bytes, a ``travel.frontend.flights.ErrorResponse`` envelope rather than
+# flight data. The wrb.fr row carries a null inner payload (row[2]) and the
+# error marker + code at row[5].
+ERROR_RESPONSE_BODY = (
+    ")]}'\n\n"
+    '[["wrb.fr",null,null,null,null,[13,null,'
+    '[["type.googleapis.com/travel.frontend.flights.ErrorResponse",'
+    "[[null,[[1781415240097441,139797767,1411962967],null,null,null,null,"
+    '[[0]]],0,"SD0uaqH5BYfK1PIP17CjoQU",'
+    '"H9YhYomwtAXsANeAwABG--------ejcxa15AAAAAGouPUgBlrsMA"],0]]]]],'
+    '["di",43],["af.httprm",43,"8734836305667018155",6]]'
+)
 
 
 def _single_chunk(payload):
@@ -141,3 +159,47 @@ class TestParseFirstWrbPayloadEdgeCases:
         outer = [["wrb.fr", None, bad_inner], ["wrb.fr", None, good_inner]]
         body = ")]}'\n\n" + json.dumps(outer)
         assert parse_first_wrb_payload(body) == [42]
+
+
+class TestErrorResponseEnvelope:
+    """Regression for issue #200 — a rejected GetShoppingResults request.
+
+    Google replies HTTP 200 with a ``travel.frontend.flights.ErrorResponse``
+    envelope instead of flight data. Previously this collapsed to ``None`` and
+    the CLI/MCP reported ``success:true, count:0`` — a rejection masquerading
+    as "no flights". The parser must now fail loud.
+    """
+
+    def test_find_api_error_detects_envelope(self):
+        result = find_api_error(ERROR_RESPONSE_BODY)
+        assert result is not None
+        assert result.error_code == 13
+
+    def test_find_api_error_none_for_normal_payload(self):
+        body = _single_chunk([1, "real flight data"])
+        assert find_api_error(body) is None
+
+    def test_find_api_error_none_for_empty_body(self):
+        assert find_api_error("") is None
+
+    def test_parse_first_wrb_payload_raises_on_error_envelope(self):
+        with pytest.raises(FlightsAPIError) as excinfo:
+            parse_first_wrb_payload(ERROR_RESPONSE_BODY)
+        assert excinfo.value.error_code == 13
+        # The message must surface that this is a Google-side rejection so the
+        # error never reads as an empty result.
+        assert "reject" in str(excinfo.value).lower()
+
+    def test_error_envelope_is_not_confused_with_valid_empty(self):
+        # A valid-but-empty data chunk (real route, no flights) must still
+        # return cleanly, never raise — only the ErrorResponse envelope raises.
+        body = _single_chunk([None, [], []])
+        assert parse_first_wrb_payload(body) == [None, [], []]
+
+    def test_data_chunk_takes_precedence_over_trailing_error_marker(self):
+        # If a decodable data chunk is present it wins; we never raise when
+        # real flight data came back.
+        good = json.dumps([1, "data"])
+        outer = [["wrb.fr", None, good]]
+        body = ")]}'\n\n" + json.dumps(outer)
+        assert parse_first_wrb_payload(body) == [1, "data"]

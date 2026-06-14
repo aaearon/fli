@@ -216,3 +216,11 @@ The release workflows (`.github/workflows/release.yml` and
 - Date search finds cheapest flights within flexible date ranges
 - MCP server uses industry-standard naming: `origin`/`destination`, `cabin_class`, `max_stops`
 - Core utilities ensure consistent parsing between CLI and MCP interfaces
+- `GetShoppingResults` intermittently rejects requests with a 200
+  `travel.frontend.flights.ErrorResponse` envelope (transient anti-abuse /
+  rate-limiting, *not* a bad payload — issue #200). `parse_first_wrb_payload`
+  detects this and raises `FlightsAPIError` (in `fli/search/exceptions.py`)
+  rather than returning `None`; `SearchFlights._fetch_flights` retries the
+  primary call (`FLI_SHOPPING_MAX_ATTEMPTS`, default 3; expansion workers do a
+  single attempt) before failing loud. A rejection must never collapse into a
+  silent `success:true, count:0` result.

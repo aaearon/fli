@@ -28,3 +28,46 @@ class SearchHTTPError(SearchClientError):
         """Store the HTTP status alongside the message for richer logging."""
         super().__init__(message)
         self.status_code = status_code
+
+
+class SearchParseError(SearchClientError):
+    """A successful (2xx) HTTP response could not be parsed into flights.
+
+    Distinct from the network / HTTP errors above — Google *did* respond,
+    but the body wasn't the shape we expected. Use this to tell "Google
+    responded but the shape changed" apart from "Google didn't respond at
+    all".
+
+    Defined here (rather than in :mod:`fli.search.flights`) so the
+    low-level wire reader in :mod:`fli.search._wire` can raise it without a
+    circular import. :mod:`fli.search.flights` re-exports it for
+    backwards compatibility.
+    """
+
+
+class FlightsAPIError(SearchParseError):
+    """Google rejected the RPC with a ``ErrorResponse`` envelope.
+
+    The FlightsFrontendService accepted the HTTP request (200 OK) but the
+    RPC itself was rejected server-side: the body is a
+    ``travel.frontend.flights.ErrorResponse`` instead of flight data
+    (issue #200). In practice this is transient anti-abuse / rate-limiting
+    of automated ``GetShoppingResults`` traffic from a single egress IP —
+    the request *payload* is valid (the identical request, and the
+    browser, succeed), and a retry typically clears it.
+
+    Surfacing this as a typed error is the fix's second half: a rejection
+    must never collapse into an empty ``success:true, count:0`` result.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: int | None = None,
+        request_id: str | None = None,
+    ):
+        """Store Google's error code and request id for logging / display."""
+        super().__init__(message)
+        self.error_code = error_code
+        self.request_id = request_id
