@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -59,8 +60,10 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         logger.warning("Ignoring invalid %s=%r; using default %s", name, raw, default)
         return default
-    if value < 0:
-        logger.warning("Ignoring negative %s=%r; using default %s", name, raw, default)
+    # Reject NaN/Inf too — they parse fine but later crash ``int(...)`` at
+    # import or produce nonsensical sleeps, defeating the fall-back guarantee.
+    if not math.isfinite(value) or value < 0:
+        logger.warning("Ignoring invalid %s=%r; using default %s", name, raw, default)
         return default
     return value
 
@@ -202,7 +205,8 @@ class SearchFlights:
         # Only the primary (session-capturing) call retries a transient
         # rejection. Parallel expansion workers do a single attempt so the
         # round-trip fan-out can't multiply requests against the anti-abuse
-        # ceiling — they re-raise immediately and the whole search fails loud.
+        # ceiling; a rejection there raises, and ``_expand_multi_leg`` skips
+        # that one candidate rather than failing the whole search.
         max_attempts = SHOPPING_MAX_ATTEMPTS if capture_session else 1
         inner = self._post_and_parse(url, encoded, max_attempts=max_attempts)
         if inner is None:

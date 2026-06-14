@@ -136,7 +136,7 @@ def find_api_error(body: str | bytes) -> FlightsAPIError | None:
             code = error_slot[0] if isinstance(error_slot[0], int) else None
             request_id = _extract_request_id(outer)
             return FlightsAPIError(
-                "Google Flights rejected the GetShoppingResults request "
+                "Google Flights rejected the request "
                 f"(ErrorResponse, code={code}). This is typically transient "
                 "rate-limiting / anti-abuse throttling of automated traffic "
                 "(issue #200) — the request payload is valid and the same "

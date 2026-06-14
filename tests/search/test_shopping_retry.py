@@ -63,7 +63,7 @@ def test_retries_then_succeeds(monkeypatch):
     search = SearchFlights()
     search.client = _ScriptedClient([ERROR_BODY, ERROR_BODY, _ok_body([1, "data"])])
 
-    result = search._post_and_parse("https://x", "f.req=...", max_attempts=3)
+    result = search._post_and_parse("https://x", "ENCODED", max_attempts=3)
 
     assert result == [1, "data"]
     assert search.client.calls == 3
@@ -75,7 +75,7 @@ def test_fails_loud_after_exhausting_retries(monkeypatch):
     search.client = _ScriptedClient([ERROR_BODY, ERROR_BODY, ERROR_BODY])
 
     with pytest.raises(FlightsAPIError) as excinfo:
-        search._post_and_parse("https://x", "f.req=...", max_attempts=3)
+        search._post_and_parse("https://x", "ENCODED", max_attempts=3)
 
     assert excinfo.value.error_code == 13
     assert excinfo.value.request_id == "req-12345"
@@ -88,7 +88,7 @@ def test_single_attempt_does_not_retry():
     search.client = _ScriptedClient([ERROR_BODY])
 
     with pytest.raises(FlightsAPIError):
-        search._post_and_parse("https://x", "f.req=...", max_attempts=1)
+        search._post_and_parse("https://x", "ENCODED", max_attempts=1)
 
     assert search.client.calls == 1
 
@@ -99,7 +99,7 @@ def test_valid_empty_body_returns_none_without_retry():
     search = SearchFlights()
     search.client = _ScriptedClient([")]}'\n\n" + json.dumps([["di", 44]])])
 
-    assert search._post_and_parse("https://x", "f.req=...", max_attempts=3) is None
+    assert search._post_and_parse("https://x", "ENCODED", max_attempts=3) is None
     assert search.client.calls == 1
 
 
@@ -144,7 +144,7 @@ def test_dates_multichunk_tolerates_one_rejected_chunk(monkeypatch):
         to_date=_future(180),
     )
 
-    good = [DatePrice(date=[datetime(2026, 7, 15)], price=199.0)]
+    good = [DatePrice(date=(datetime(2026, 7, 15),), price=199.0)]
 
     def _fake_chunk(self, cf, **kwargs):
         # First chunk is rejected; later chunks return data.
