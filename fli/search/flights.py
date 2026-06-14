@@ -44,6 +44,27 @@ from fli.search.exceptions import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+
+def _env_float(name: str, default: float) -> float:
+    """Read a non-negative float tuning knob from the environment.
+
+    A malformed value falls back to ``default`` with a warning rather than
+    crashing import (these knobs are optional tuning, not correctness).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using default %s", name, raw, default)
+        return default
+    if value < 0:
+        logger.warning("Ignoring negative %s=%r; using default %s", name, raw, default)
+        return default
+    return value
+
+
 # Bounded retry for the primary GetShoppingResults call. Google now
 # intermittently rejects the RPC with a transient ``ErrorResponse``
 # (issue #200) — anti-abuse throttling, not a malformed request. A cold
@@ -52,9 +73,9 @@ logger = logging.getLogger(__name__)
 # turn the common "empty result" failure back into real flights without
 # hammering the endpoint. Configurable via env; set
 # ``FLI_SHOPPING_MAX_ATTEMPTS=1`` to fail loud on the first rejection.
-SHOPPING_MAX_ATTEMPTS = max(1, int(os.environ.get("FLI_SHOPPING_MAX_ATTEMPTS", "3")))
-SHOPPING_RETRY_DELAY = float(os.environ.get("FLI_SHOPPING_RETRY_DELAY", "1.0"))
-SHOPPING_RETRY_JITTER = float(os.environ.get("FLI_SHOPPING_RETRY_JITTER", "1.0"))
+SHOPPING_MAX_ATTEMPTS = max(1, int(_env_float("FLI_SHOPPING_MAX_ATTEMPTS", 3)))
+SHOPPING_RETRY_DELAY = _env_float("FLI_SHOPPING_RETRY_DELAY", 1.0)
+SHOPPING_RETRY_JITTER = _env_float("FLI_SHOPPING_RETRY_JITTER", 1.0)
 
 
 class SearchFlights:
@@ -538,13 +559,21 @@ class SearchFlights:
         def expand(outbound: FlightResult):
             next_filters = deepcopy(filters)
             next_filters.flight_segments[selected_count].selected_flight = outbound
-            sub_flights = self._fetch_flights(
-                next_filters,
-                currency=currency,
-                language=language,
-                country=country,
-                capture_session=False,
-            )
+            try:
+                sub_flights = self._fetch_flights(
+                    next_filters,
+                    currency=currency,
+                    language=language,
+                    country=country,
+                    capture_session=False,
+                )
+            except FlightsAPIError as e:
+                # A transient rejection on one outbound candidate's next-leg
+                # fetch must not sink the whole round-trip — skip this
+                # candidate and keep the combos we can build. The primary
+                # outbound search already fails loud if it is rejected.
+                logger.warning("Skipping next-leg expansion for one candidate: %s", e)
+                return outbound, None
             if sub_flights is None:
                 return outbound, None
             # If more segments remain unselected (multi-city ≥ 3), keep

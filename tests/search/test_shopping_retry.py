@@ -101,3 +101,65 @@ def test_valid_empty_body_returns_none_without_retry():
 
     assert search._post_and_parse("https://x", "f.req=...", max_attempts=3) is None
     assert search.client.calls == 1
+
+
+def test_env_float_falls_back_on_garbage(monkeypatch):
+    # Malformed tuning knobs must not crash import — fall back to the default.
+    monkeypatch.setenv("FLI_SHOPPING_RETRY_DELAY", "not-a-number")
+    assert flights_module._env_float("FLI_SHOPPING_RETRY_DELAY", 2.5) == 2.5
+    monkeypatch.setenv("FLI_SHOPPING_RETRY_DELAY", "-1")
+    assert flights_module._env_float("FLI_SHOPPING_RETRY_DELAY", 2.5) == 2.5
+    monkeypatch.delenv("FLI_SHOPPING_RETRY_DELAY", raising=False)
+    assert flights_module._env_float("FLI_SHOPPING_RETRY_DELAY", 2.5) == 2.5
+    monkeypatch.setenv("FLI_SHOPPING_RETRY_DELAY", "3.5")
+    assert flights_module._env_float("FLI_SHOPPING_RETRY_DELAY", 2.5) == 3.5
+
+
+def test_dates_multichunk_tolerates_one_rejected_chunk(monkeypatch):
+    """A rejected chunk in a multi-chunk date search is skipped, not fatal."""
+    from datetime import datetime, timedelta
+
+    from fli.models import (
+        Airport,
+        DateSearchFilters,
+        FlightSegment,
+        PassengerInfo,
+    )
+    from fli.search.dates import DatePrice, SearchDates
+
+    def _future(days):
+        return (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+
+    # > MAX_DAYS_PER_SEARCH (61) so search() chunks and uses parallel_map.
+    filters = DateSearchFilters(
+        passenger_info=PassengerInfo(adults=1),
+        flight_segments=[
+            FlightSegment(
+                departure_airport=[[Airport.JFK, 0]],
+                arrival_airport=[[Airport.LAX, 0]],
+                travel_date=_future(10),
+            )
+        ],
+        from_date=_future(10),
+        to_date=_future(180),
+    )
+
+    good = [DatePrice(date=[datetime(2026, 7, 15)], price=199.0)]
+
+    def _fake_chunk(self, cf, **kwargs):
+        # First chunk is rejected; later chunks return data.
+        if _fake_chunk.calls == 0:
+            _fake_chunk.calls += 1
+            raise FlightsAPIError("rejected", error_code=13)
+        _fake_chunk.calls += 1
+        return good
+
+    _fake_chunk.calls = 0
+
+    monkeypatch.setattr(SearchDates, "_search_chunk", _fake_chunk)
+    results = SearchDates().search(filters)
+
+    # The rejected chunk is skipped; the surviving chunks' prices come back.
+    assert _fake_chunk.calls >= 2, "range should have split into multiple chunks"
+    assert results is not None and len(results) >= 1
+    assert all(r == good[0] for r in results)

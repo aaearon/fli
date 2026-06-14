@@ -18,6 +18,7 @@ from fli.search._concurrency import parallel_map
 from fli.search._urls import with_locale_params
 from fli.search._wire import parse_first_wrb_payload
 from fli.search.client import get_client
+from fli.search.exceptions import FlightsAPIError
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +91,18 @@ class SearchDates:
         # matched ``current_from``.
         chunk_filters = self._build_chunk_filters(filters, from_date, to_date)
 
-        chunk_results = parallel_map(
-            lambda cf: self._search_chunk(
-                cf, currency=currency, language=language, country=country
-            ),
-            chunk_filters,
-        )
+        def _search_chunk_tolerant(cf: DateSearchFilters) -> list[DatePrice] | None:
+            # A transient ErrorResponse rejection (issue #200) on one chunk
+            # must not sink the whole multi-chunk date search — skip it and
+            # keep the chunks that did return. The single-chunk path below
+            # still fails loud so a fully rejected search isn't reported empty.
+            try:
+                return self._search_chunk(cf, currency=currency, language=language, country=country)
+            except FlightsAPIError as e:
+                logger.warning("Skipping one date chunk after rejection: %s", e)
+                return None
+
+        chunk_results = parallel_map(_search_chunk_tolerant, chunk_filters)
 
         all_results: list[DatePrice] = []
         for r in chunk_results:

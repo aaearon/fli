@@ -228,6 +228,57 @@ class TestExpandMultiLeg:
         # Only the first outbound produced a combo.
         assert len(combos) == 1
 
+    def test_transient_rejection_on_one_leg_does_not_sink_search(self):
+        """A FlightsAPIError on one candidate's next-leg fetch is skipped.
+
+        Regression for issue #200: previously a rejected return-leg fetch
+        returned None and was skipped; the fail-loud change made it raise,
+        which (through parallel_map) would have failed the entire round-trip.
+        The expansion worker must tolerate it and keep the viable combos.
+        """
+        from fli.search.exceptions import FlightsAPIError
+
+        client = SearchFlights()
+        outbound = [_result(Airport.JFK, Airport.LAX), _result(Airport.JFK, Airport.LAX, hour=14)]
+
+        def _fake_fetch(filters, **kwargs):
+            # First expansion succeeds; second is rejected mid-flight.
+            if _fake_fetch.calls == 0:
+                _fake_fetch.calls += 1
+                return [_result(Airport.LAX, Airport.JFK)]
+            _fake_fetch.calls += 1
+            raise FlightsAPIError("rejected", error_code=13)
+
+        _fake_fetch.calls = 0
+
+        rt_filters = FlightSearchFilters(
+            trip_type=TripType.ROUND_TRIP,
+            passenger_info=PassengerInfo(adults=1),
+            flight_segments=[
+                FlightSegment(
+                    departure_airport=[[Airport.JFK, 0]],
+                    arrival_airport=[[Airport.LAX, 0]],
+                    travel_date=_future(60),
+                ),
+                FlightSegment(
+                    departure_airport=[[Airport.LAX, 0]],
+                    arrival_airport=[[Airport.JFK, 0]],
+                    travel_date=_future(63),
+                ),
+            ],
+        )
+        with patch.object(SearchFlights, "_fetch_flights", side_effect=_fake_fetch):
+            combos = client._expand_multi_leg(
+                outbound,
+                rt_filters,
+                top_n=5,
+                currency=None,
+                language=None,
+                country=None,
+            )
+        # The rejected candidate is dropped; the successful one survives.
+        assert len(combos) == 1
+
 
 def _priceless_result(dep: Airport, arr: Airport, hour: int = 9) -> FlightResult:
     """Mirrors ``_result`` but with ``price=None`` (issue #165 shape)."""
